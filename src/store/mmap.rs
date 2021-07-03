@@ -7,7 +7,7 @@ use anyhow::Result;
 use memmap::MmapMut;
 
 use crate::merkle::Element;
-use crate::store::{Store, StoreConfig};
+use crate::store::{Store, StoreConfig, Range};
 
 /// Store that saves the data on disk, and accesses it using memmap.
 #[derive(Debug)]
@@ -218,6 +218,10 @@ impl<E: Element> Store<E> for MmapStore<E> {
         Ok(())
     }
 
+    fn read_ranges_into(&self, _ranges: Vec<Range>, _buf: &mut [u8]) -> Result<Vec<Result<usize>>> {
+        unimplemented!("Not required here");
+    }
+
     fn read_range_into(&self, _start: usize, _end: usize, _buf: &mut [u8]) -> Result<()> {
         unimplemented!("Not required here");
     }
@@ -236,6 +240,16 @@ impl<E: Element> Store<E> for MmapStore<E> {
             .chunks(E::byte_len())
             .map(E::from_slice)
             .collect())
+    }
+
+    fn offset_by_range(&self, _range: Range) -> usize {
+        0
+    }
+    fn path_by_range(&self, _range: Range) -> Option<&PathBuf> {
+        Some(&self.path)
+    }
+    fn path(&self) -> Option<&PathBuf> {
+        Some(&self.path)
     }
 
     fn len(&self) -> usize {

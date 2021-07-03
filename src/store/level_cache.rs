@@ -4,7 +4,7 @@ use std::io::{copy, Read, Seek, SeekFrom};
 use std::iter::FromIterator;
 use std::marker::PhantomData;
 use std::ops;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
@@ -20,7 +20,8 @@ use crate::merkle::{
     get_merkle_tree_cache_size, get_merkle_tree_leafs, get_merkle_tree_len, log2_pow2, next_pow2,
     Element,
 };
-use crate::store::{ExternalReader, Store, StoreConfig, BUILD_CHUNK_NODES};
+use crate::store::{ExternalReader, Store, StoreConfig, BUILD_CHUNK_NODES, Range};
+use log::{debug, info, error};
 
 /// The LevelCacheStore is used to reduce the on-disk footprint even
 /// further to the minimum at the cost of build time performance.
@@ -53,6 +54,8 @@ pub struct LevelCacheStore<E: Element, R: Read + Send + Sync> {
     // If provided, the store will use this method to access base
     // layer data.
     reader: Option<ExternalReader<R>>,
+    path: String,
+    data_path: PathBuf,
 
     _e: PhantomData<E>,
 }
@@ -66,6 +69,7 @@ impl<E: Element, R: Read + Send + Sync> fmt::Debug for LevelCacheStore<E, R> {
             .field("loaded_from_disk", &self.loaded_from_disk)
             .field("cache_index_start", &self.cache_index_start)
             .field("store_size", &self.store_size)
+            .field("path", &self.path)
             .finish()
     }
 }
@@ -80,7 +84,8 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
     ) -> Result<Self> {
         let data_path = StoreConfig::data_path(&config.path, &config.id);
 
-        let file = File::open(data_path)?;
+        let path = data_path.as_path().display().to_string();
+        let file = OpenOptions::new().write(true).read(true).open(data_path.clone())?;
         let metadata = file.metadata()?;
         let store_size = metadata.len() as usize;
 
@@ -125,6 +130,8 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
             store_size,
             loaded_from_disk: false,
             reader: Some(reader),
+            path,
+            data_path: data_path,
             _e: Default::default(),
         })
     }
@@ -139,6 +146,7 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
 impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
     fn new_with_config(size: usize, branches: usize, config: StoreConfig) -> Result<Self> {
         let data_path = StoreConfig::data_path(&config.path, &config.id);
+        let path = data_path.as_path().display().to_string();
 
         // If the specified file exists, load it from disk.  This is
         // the only supported usage of this call for this type of
@@ -152,7 +160,7 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
             .write(true)
             .read(true)
             .create_new(true)
-            .open(data_path)?;
+            .open(data_path.clone())?;
 
         let store_size = E::byte_len() * size;
         let leafs = get_merkle_tree_leafs(size, branches)?;
@@ -179,6 +187,8 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
             store_size,
             loaded_from_disk: false,
             reader: None,
+            path,
+            data_path: data_path,
             _e: Default::default(),
         })
     }
@@ -197,6 +207,8 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
             store_size,
             loaded_from_disk: false,
             reader: None,
+            path: "tmp".to_string(),
+            data_path: PathBuf::from("/tmp"),
             _e: Default::default(),
         })
     }
@@ -244,8 +256,9 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
     // Used for opening v1 compacted DiskStores.
     fn new_from_disk(store_range: usize, branches: usize, config: &StoreConfig) -> Result<Self> {
         let data_path = StoreConfig::data_path(&config.path, &config.id);
-
-        let file = File::open(data_path)?;
+        
+        let path = data_path.as_path().display().to_string();
+        let file = OpenOptions::new().write(true).read(true).open(data_path.clone())?;
         let metadata = file.metadata()?;
         let store_size = metadata.len() as usize;
 
@@ -292,6 +305,8 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
             loaded_from_disk: true,
             store_size,
             reader: None,
+            path,
+            data_path: data_path,
             _e: Default::default(),
         })
     }
@@ -345,6 +360,23 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
         self.store_read_into(start, end, buf)
     }
 
+    fn read_ranges_into(&self, ranges: Vec<Range>, buf: &mut [u8]) -> Result<Vec<Result<usize>>> {
+        for range in &ranges {
+            let start = range.start * self.elem_len;
+            let end = range.end * self.elem_len;
+
+            let len = self.len * self.elem_len;
+            ensure!(start < len, "start out of range {} >= {}", start, len);
+            ensure!(end <= len, "end out of range {} > {}", end, len);
+            ensure!(
+                start <= self.data_width * self.elem_len || start >= self.cache_index_start,
+                "out of bounds"
+            );
+        }
+
+        self.store_read_ranges_into(ranges, buf)
+    }
+
     fn read_range_into(&self, start: usize, end: usize, buf: &mut [u8]) -> Result<()> {
         let start = start * self.elem_len;
         let end = end * self.elem_len;
@@ -377,6 +409,30 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
             .chunks(self.elem_len)
             .map(E::from_slice)
             .collect())
+    }
+
+    fn offset_by_range(&self, range: Range) -> usize {
+        let start = range.start * self.elem_len;
+
+        // If an external reader was specified for the base layer, use it.
+        if start < self.data_width * self.elem_len && self.reader.is_some() {
+            return self.reader.as_ref().unwrap().offset;
+        }
+
+        0
+    }
+    fn path_by_range(&self, range: Range) -> Option<&PathBuf> {
+        let start = range.start * self.elem_len;
+
+        // If an external reader was specified for the base layer, use it.
+        if start < self.data_width * self.elem_len && self.reader.is_some() {
+            return Some(&self.reader.as_ref().unwrap().data_path);
+        }
+
+        Some(&self.data_path)
+    }
+    fn path(&self) -> Option<&PathBuf> {
+        Some(&self.data_path)
     }
 
     fn len(&self) -> usize {
@@ -782,6 +838,110 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
         );
 
         Ok(E::from_slice(&self.store_read_range_internal(start, end)?))
+    }
+
+    pub fn store_read_ranges_into(&self, ranges: Vec<Range>, buf: &mut [u8]) -> Result<Vec<Result<usize>>> {
+        let mut reader_ranges = Vec::new();
+        let mut direct_ranges = Vec::new();
+        let mut direct_sizes = Vec::new();
+
+        debug!("READ RANGES from {} | {}", self.path, ranges.len());
+
+        for range in ranges.clone() {
+            let start = range.start * self.elem_len;
+            let end = range.end * self.elem_len;
+            let read_len = end - start;
+
+            debug!("  start: {} | {}, end: {} | {} - {}, from reader {} ({} <=? {} * {} = {}) in {} | {:?}",
+                range.start,
+                start,
+                range.end,
+                end,
+                self.elem_len,
+                start <= self.data_width * self.elem_len,
+                start,
+                self.data_width,
+                self.elem_len,
+                self.data_width * self.elem_len,
+                self.path,
+                self.reader.as_ref().unwrap().data_path);
+
+            ensure!(
+                start <= self.data_width * self.elem_len || start >= self.cache_index_start,
+                "Invalid read start"
+            );
+
+            let mut range = range.clone();
+            range.start = start;
+            range.end = end;
+
+            if start < self.data_width * self.elem_len && self.reader.is_some() {
+                reader_ranges.push(range);
+            } else {
+                direct_ranges.push(range);
+                match self.store_read_into(start, end, &mut buf[range.buf_start..range.buf_end]) {
+                    Err(_) => {
+                        error!("fail to read {}-{} from {} local cache", start, end, self.path);
+                        direct_sizes.push(Err(anyhow!("fail to read file")));
+                    },
+                    Ok(_) => {
+                        direct_sizes.push(Ok(read_len));
+                    }
+                }
+            }
+        }
+
+        let reader_sizes = if self.reader.is_some() {
+            self.reader
+                .as_ref()
+                .unwrap()
+                .read_ranges(reader_ranges.clone(), buf)
+                .with_context(|| {
+                    format!(
+                        "failed to read multi range",
+                        )
+                })?
+        } else {
+            Vec::new()
+        };
+
+        let mut return_sizes = Vec::new();
+
+        for range in &ranges {
+            let mut inserted = false;
+            for (j, direct_range) in direct_ranges.iter().enumerate() {
+                if direct_range.index == range.index {
+                    match direct_sizes[j] {
+                        Ok(size) => return_sizes.push(Ok(size)),
+                        Err(_) => {
+                            error!("fail to read {}-{} from {} cache", range.start, range.end, self.path);
+                            return_sizes.push(Err(anyhow!("fail to read range")));
+                        }
+                    }
+                    inserted = true;
+                    break;
+                }
+            }
+
+            if inserted {
+                continue;
+            }
+
+            for (j, reader_range) in reader_ranges.iter().enumerate() {
+                if reader_range.index == range.index {
+                    match reader_sizes[j] {
+                        Ok(size) => return_sizes.push(Ok(size)),
+                        Err(_) => {
+                            error!("fail to read {}-{} from {} reader", range.start, range.end, self.path);
+                            return_sizes.push(Err(anyhow!("fail to read range")));
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        Ok(return_sizes)
     }
 
     pub fn store_read_into(&self, start: usize, end: usize, buf: &mut [u8]) -> Result<()> {

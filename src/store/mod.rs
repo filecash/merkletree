@@ -16,6 +16,7 @@ use typenum::marker_traits::Unsigned;
 
 use crate::hash::Algorithm;
 use crate::merkle::{get_merkle_tree_row_count, log2_pow2, next_pow2, Element};
+use log::{warn, debug};
 
 /// Tree size (number of nodes) used as threshold to decide which build algorithm
 /// to use. Small trees (below this value) use the old build algorithm, optimized
@@ -38,30 +39,80 @@ pub use level_cache::LevelCacheStore;
 pub use mmap::MmapStore;
 pub use vec::VecStore;
 
+#[derive(Debug, Copy, Clone)]
+pub struct Range {
+    pub index: usize,
+    pub offset: usize,
+    pub start: usize,
+    pub end: usize,
+    pub buf_start: usize,
+    pub buf_end: usize,
+}
+
 #[derive(Clone)]
 pub struct ExternalReader<R: Read + Send + Sync> {
+    pub data_path: PathBuf,
     pub offset: usize,
     pub source: R,
+    pub path: String,
     pub read_fn: fn(start: usize, end: usize, buf: &mut [u8], source: &R) -> Result<usize>,
+    pub read_ranges: fn(ranges: Vec<Range>, buf: &mut [u8], path: String) -> Result<Vec<Result<usize>>>,
 }
 
 impl<R: Read + Send + Sync> ExternalReader<R> {
     pub fn read(&self, start: usize, end: usize, buf: &mut [u8]) -> Result<usize> {
         (self.read_fn)(start + self.offset, end + self.offset, buf, &self.source)
     }
+
+    pub fn read_ranges(&self, ranges: Vec<Range>, buf: &mut [u8]) -> Result<Vec<Result<usize>>> {
+        let mut off_ranges = Vec::new();
+        for range in ranges {
+            off_ranges.push(Range {
+                index: range.index,
+                start: range.offset + range.start,
+                end: range.offset + range.end,
+                offset: range.offset,
+                buf_start: range.buf_start,
+                buf_end: range.buf_end,
+            });
+            debug!("reader read ranges {}-{} | {} | {}",
+                   range.start,
+                   range.end,
+                   self.offset,
+                   self.path.clone());
+        }
+        (self.read_ranges)(off_ranges, buf, self.path.clone())
+    }
 }
 
 impl ExternalReader<std::fs::File> {
     pub fn new_from_config(replica_config: &ReplicaConfig, index: usize) -> Result<Self> {
-        let reader = OpenOptions::new().read(true).open(&replica_config.path)?;
+        let reader = OpenOptions::new().read(true).open(&replica_config.path.clone())?;
 
         Ok(ExternalReader {
             offset: replica_config.offsets[index],
             source: reader,
+            data_path: replica_config.path.clone(),
+            path: (replica_config.path).to_str().unwrap().to_string(),
             read_fn: |start, end, buf: &mut [u8], reader: &std::fs::File| {
                 reader.read_exact_at(start as u64, &mut buf[0..end - start])?;
 
                 Ok(end - start)
+            },
+            read_ranges: |ranges, buf, path: String| {
+                let mut sizes = Vec::new();
+                debug!("multi read from local {} start", path);
+                for range in ranges {
+                    debug!("multi read from local: start {} / {}, end {} / {}, path {} | {} | {}",
+                            range.start, range.buf_start, range.end, range.buf_end,
+                            path, buf.len(), range.index);
+                    let reader = OpenOptions::new().read(true).open(&path)?;
+                    let read_len = range.end - range.start;
+                    reader.read_exact_at(range.start as u64, &mut buf[range.buf_start..range.buf_end])?;
+                    sizes.push(Ok(read_len));
+                }
+                debug!("multi read from local {} done", path);
+                Ok(sizes)
             },
         })
     }
@@ -241,6 +292,10 @@ pub trait Store<E: Element>: std::fmt::Debug + Send + Sync + Sized {
     fn read_range(&self, r: ops::Range<usize>) -> Result<Vec<E>>;
     fn read_into(&self, pos: usize, buf: &mut [u8]) -> Result<()>;
     fn read_range_into(&self, start: usize, end: usize, buf: &mut [u8]) -> Result<()>;
+    fn read_ranges_into(&self, ranges: Vec<Range>, buf: &mut [u8]) -> Result<Vec<Result<usize>>>;
+    fn path(&self) -> Option<&PathBuf>;
+    fn path_by_range(&self, range: Range) -> Option<&PathBuf>;
+    fn offset_by_range(&self, range: Range) -> usize;
 
     fn len(&self) -> usize;
     fn loaded_from_disk(&self) -> bool;
